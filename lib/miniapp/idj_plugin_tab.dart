@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core_bridge.dart' show AppFailure;
 import '../idj_plugin_store.dart';
+import '../idj_signing.dart';
 
 /// 小程序内「插件」tab（设计 §4）：已安装 / 安装入口 / 订阅 / 更新检查
 /// 四区。只作 tab 内容，不独立导航、不注册路由。
@@ -28,6 +29,397 @@ String idjTypeLabel(String type) => switch (type) {
   'live' => '直播',
   _ => type,
 };
+
+/// P0-1/P0-2（2026-11-26 整改）：安装确认 sheet。
+/// 展示：插件身份、权限差异（更新时）、申请域名、签名状态。
+/// 验签通过时可被上层跳过（内置插件免确认直装）；无签名/验不过
+/// 必须走这里，用户点确认才装。
+class IdjInstallConfirmSheet extends StatelessWidget {
+  const IdjInstallConfirmSheet({
+    super.key,
+    required this.bundle,
+    required this.bundleBytes,
+    this.oldManifest,
+    required this.onConfirm,
+    required this.onCancel,
+  });
+
+  final IdjPluginBundle bundle;
+  final int bundleBytes;
+  final IdjPluginManifest? oldManifest;
+  final VoidCallback onConfirm;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final manifest = bundle.manifest;
+    final diff = oldManifest == null
+        ? null
+        : IdjPluginStore.permissionDiff(oldManifest!, manifest);
+    final hasDiff = diff != null && !diff.isEmpty;
+    final sectionNote = idjSectionNoteForManifest(manifest);
+    final domains = <String>{
+      ...manifest.httpDomains,
+      ...manifest.mediaDomains,
+    }.toList();
+    final isUpdate = oldManifest != null;
+    final sig = bundle.signatureResult;
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: colors.onSurfaceVariant.withValues(alpha: 0.35),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    isUpdate ? '更新插件' : '安装插件',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  key: const ValueKey('idj-confirm-close'),
+                  icon: const Icon(Icons.close),
+                  onPressed: onCancel,
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: colors.primaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    manifest.name.isEmpty
+                        ? '插'
+                        : String.fromCharCode(
+                            manifest.name.runes.first,
+                          ),
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: colors.onPrimaryContainer,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        manifest.name,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '${idjTypeLabel(manifest.type)} · ${manifest.type}',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: colors.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    'v${manifest.version}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                ),
+                if (manifest.adult) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colors.errorContainer,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      '🔞 成人',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: colors.onErrorContainer,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            // P0-1：签名状态条。unsigned/invalid 都显式警告。
+            if (!sig.isValid) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colors.errorContainer.withValues(alpha: 0.75),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      sig.isUnsigned
+                          ? '⚠️ 该插件未经签名'
+                          : '⚠️ 签名验证未通过',
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      sig.isUnsigned
+                          ? '无法确认来源。它将在沙箱权限内运行，'
+                              '可访问下方列出的域名。请确认你信任这个来源。'
+                          : '原因：${sig.reason ?? '未知'}。'
+                              '可能被篡改或来源不可信，建议取消安装。',
+                      style: const TextStyle(fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ] else ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colors.primaryContainer.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Text(
+                  '✅ 已通过发布者签名验证',
+                  style: TextStyle(fontSize: 13),
+                ),
+              ),
+            ],
+            if (sectionNote != null) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colors.tertiaryContainer.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  sectionNote,
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ),
+            ],
+            if (hasDiff) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: colors.errorContainer.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '新版本权限变化',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    for (final line in diff.describe())
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Text(
+                          line,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            _IdjInfoRow(label: '插件 id', value: manifest.id),
+            if (manifest.author.isNotEmpty)
+              _IdjInfoRow(label: '作者', value: manifest.author),
+            _IdjInfoRow(
+              label: '存储需求',
+              value: '插件包约 ${_formatBytes(bundleBytes)}',
+            ),
+            _IdjInfoRow(
+              label: '更新地址',
+              value: manifest.updateUrl.isEmpty ? '无' : '有',
+            ),
+            if (manifest.description.isNotEmpty)
+              _IdjInfoRow(label: '简介', value: manifest.description),
+            const SizedBox(height: 10),
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              title: Text(
+                '申请域名（${manifest.httpDomains.length} 个）',
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              children: [
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final domain in domains)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.surfaceContainerHighest,
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Text(
+                            domain,
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 8),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    key: const ValueKey('idj-confirm-cancel'),
+                    onPressed: onCancel,
+                    child: const Text('取消'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton(
+                    key: const ValueKey('idj-confirm-install'),
+                    onPressed: onConfirm,
+                    child: Text(hasDiff ? '确认更新' : '仍要安装'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} KB';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+/// 确认 sheet 里的单行信息（label + value），v66 原版恢复。
+class _IdjInfoRow extends StatelessWidget {
+  const _IdjInfoRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 84,
+            child: Text(
+              label,
+              style: TextStyle(fontSize: 14, color: colors.onSurfaceVariant),
+            ),
+          ),
+          Expanded(
+            child: Text(value, style: const TextStyle(fontSize: 14)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 弹安装确认 sheet：点「仍要安装/确认更新」回 true，取消/关掉回 false。
+Future<bool> showIdjInstallConfirmSheet(
+  BuildContext context, {
+  required IdjPluginBundle bundle,
+  required int bundleBytes,
+  IdjPluginManifest? oldManifest,
+}) async {
+  final confirmed = await showModalBottomSheet<bool>(
+    context: context,
+    showDragHandle: true,
+    isScrollControlled: true,
+    builder: (sheetContext) => IdjInstallConfirmSheet(
+      bundle: bundle,
+      bundleBytes: bundleBytes,
+      oldManifest: oldManifest,
+      onConfirm: () => Navigator.pop(sheetContext, true),
+      onCancel: () => Navigator.pop(sheetContext, false),
+    ),
+  );
+  return confirmed == true;
+}
 
 /// 已安装行的显示名：注册进片库用的那个名（含 🔞 前缀规则）。
 String idjDisplayName(IdjInstalledPlugin item) {
@@ -377,10 +769,30 @@ class IdjPluginActions {
       return null;
     }
     final oldManifest = await store.readInstalledManifest(bundle.manifest.id);
+    // P0-1/P0-2（2026-11-26 整改）：
+    // - 验签通过（内置作者公钥）→ 免确认直装；
+    // - 无签名 / 验不过 / 权限扩大 → 必须弹确认 sheet，用户点确认才装。
+    final diff = oldManifest == null
+        ? null
+        : IdjPluginStore.permissionDiff(oldManifest, bundle.manifest);
+    final needPermissionConfirm = diff != null && diff.needsConfirmation;
+    final needSignatureConfirm = !bundle.signatureResult.isValid;
+    if (needSignatureConfirm || needPermissionConfirm) {
+      if (!context.mounted) return null;
+      final confirmed = await showIdjInstallConfirmSheet(
+        context,
+        bundle: bundle,
+        bundleBytes: utf8.encode(text).length,
+        oldManifest: oldManifest,
+      );
+      if (!confirmed) return null;
+    }
     try {
       final installed = await store.installBundleText(
         text,
         sourceLabel: sourceLabel,
+        permissionConfirmed: needPermissionConfirm,
+        signatureConfirmed: needSignatureConfirm,
       );
       if (context.mounted) {
         ScaffoldMessenger.maybeOf(context)?.showSnackBar(
@@ -403,7 +815,7 @@ class IdjPluginActions {
   }
 
   /// 装完后的结果提示文案：新装说「已安装」，更新说「已更新到 vX」；
-  /// 更新且权限有扩大时顺带一句差异（只报域名数等概要，不拦路）。
+  /// 更新且权限有扩大时顺带一句差异（差异详情已在确认 sheet 展示过）。
   static String _installResultMessage(
     IdjPluginManifest manifest,
     IdjPluginManifest? oldManifest,
@@ -422,7 +834,7 @@ class IdjPluginActions {
   }
 
   /// 订阅里装一个插件：按 `manifestUrl` 下载正文再分流，
-  /// 拿到包后直接装（免确认，更新有权限扩大也只在结果提示里带一句）。
+  /// 拿到包后走与文件安装同一套确认逻辑（签名/权限差异）。
   static Future<IdjInstalledPlugin?> installSubscriptionPlugin(
     BuildContext context,
     IdjPluginStore store,
