@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 
 import 'app_update.dart';
 import 'update_config.dart';
-import 'update_download.dart';
 
+/// 软件更新页。
+///
+/// P1 更新策略整改（2026-11-27）：移除「App 内下载 APK + 调系统安装器」，
+/// 统一为「检查更新 → 打开发布页」，下载与安装由用户在浏览器与系统
+/// 安装器完成。原「强制更新」窗口只作为文案提示，不再影响交互。
 class AppUpdateScreen extends StatefulWidget {
   const AppUpdateScreen({super.key});
 
@@ -20,8 +24,6 @@ class _AppUpdateScreenState extends State<AppUpdateScreen> {
   String? _error;
   bool _busy = false;
   bool _checked = false;
-  DownloadProgress? _progress;
-  final ResumableDownloader _downloader = ResumableDownloader();
 
   @override
   void initState() {
@@ -52,35 +54,6 @@ class _AppUpdateScreenState extends State<AppUpdateScreen> {
       if (mounted) setState(() => _error = '$error');
     } finally {
       if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _downloadAndInstall() async {
-    final latest = _latest;
-    if (latest == null) return;
-    setState(() {
-      _busy = true;
-      _error = null;
-      _progress = null;
-    });
-    try {
-      final file = await AppUpdateChecker.downloadApk(
-        latest,
-        downloader: _downloader,
-        onProgress: (progress) {
-          if (mounted) setState(() => _progress = progress);
-        },
-      );
-      await AppUpdateChannel.installApk(file.path);
-    } catch (error) {
-      if (mounted) setState(() => _error = '$error');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _progress = null;
-        });
-      }
     }
   }
 
@@ -154,15 +127,9 @@ class _AppUpdateScreenState extends State<AppUpdateScreen> {
                   icon: const Icon(Icons.refresh),
                   label: const Text('检查更新'),
                 ),
-                if (hasUpdate && Platform.isAndroid)
+                if (hasUpdate)
                   FilledButton.icon(
-                    onPressed: _busy ? null : _downloadAndInstall,
-                    icon: const Icon(Icons.download),
-                    label: Text('下载并安装 ${latest.version}'),
-                  ),
-                if (hasUpdate && !Platform.isAndroid)
-                  FilledButton.icon(
-                    onPressed: _openReleasePage,
+                    onPressed: _busy ? null : _openReleasePage,
                     icon: const Icon(Icons.open_in_browser),
                     label: const Text('打开发布页下载'),
                   ),
@@ -172,7 +139,7 @@ class _AppUpdateScreenState extends State<AppUpdateScreen> {
               Padding(
                 padding: const EdgeInsets.only(top: 12),
                 child: Text(
-                  '强制更新：请在窗口期内完成更新${_forceWindowText(latest)}，否则旧版本将无法继续使用。',
+                  '发布方提示：此版本声明了更新窗口${_forceWindowText(latest)}，建议尽快更新。',
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
@@ -186,12 +153,6 @@ class _AppUpdateScreenState extends State<AppUpdateScreen> {
                 padding: const EdgeInsets.only(top: 12),
                 child: Text('更新说明：\n${latest!.notes}'),
               ),
-            if (_progress != null) ...[
-              const SizedBox(height: 16),
-              LinearProgressIndicator(value: _progress!.fraction),
-              const SizedBox(height: 6),
-              Text('已下载 ${_progress!.received} / ${_progress!.total} 字节'),
-            ],
           ],
           if (_error != null)
             Padding(
