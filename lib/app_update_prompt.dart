@@ -5,16 +5,22 @@ import 'package:flutter/material.dart';
 import 'app_update.dart';
 
 /// 启动后发现新版本时弹的更新提示框。
-/// 安卓点“下载并安装”直接在框里下载（带进度）再调系统安装器；
-/// 非安卓点“打开发布页”跳去发布页下载。
-/// “稍后再说”只记这一个版本，有更新的版本下次启动还会再弹；
-/// 强制更新（发布说明里带 FORCE_AFTER/FORCE_UNTIL 且在窗口内）没有
-/// “稍后再说”，也不能点框外关掉。
+///
+/// P1 更新策略整改（2026-11-27）：移除「框内下载 APK + 调系统安装器」
+/// 路径，全部平台统一为「提示 + 跳发布页」，用户在浏览器里自己下载、
+/// 自己装。App 不再持有「下载并安装 APK」的能力（AppUpdateBridge 的
+/// installApk 通道不再被调用；REQUEST_INSTALL_PACKAGES 权限可在
+/// Manifest 中移除）。
+/// 「稍后再说」只记这一个版本，有更新的版本下次启动还会再弹；
+/// 原强制更新（FORCE_AFTER/FORCE_UNTIL）窗口不再改变弹窗行为——
+/// 只把窗口信息显示出来，永远可以关掉、永远可以跳过（提示更新，
+/// 不强制）。
 Future<void> showAppUpdatePrompt(
   BuildContext context, {
   required AppVersion current,
   required AppReleaseInfo latest,
 }) async {
+  // 仅用于文案展示：告知发布说明里声明过强制窗口（不再据此改变交互）。
   final forced = AppUpdateChecker.isForceUpdate(
     current,
     latest,
@@ -22,40 +28,17 @@ Future<void> showAppUpdatePrompt(
   );
   await showDialog<void>(
     context: context,
-    barrierDismissible: !forced,
+    barrierDismissible: true,
     builder: (dialogContext) {
-      var downloading = false;
-      var received = 0;
-      var total = 0;
       String? error;
       return StatefulBuilder(
         builder: (context, setState) {
-          Future<void> downloadAndInstall() async {
-            setState(() {
-              downloading = true;
-              error = null;
-              received = 0;
-              total = 0;
-            });
-            try {
-              final file = await AppUpdateChecker.downloadApk(
-                latest,
-                onProgress: (progress) {
-                  setState(() {
-                    received = progress.received;
-                    total = progress.total;
-                  });
-                },
-              );
-              await AppUpdateChannel.installApk(file.path);
-              if (context.mounted) Navigator.of(context).pop();
-            } catch (e) {
-              if (context.mounted) {
-                setState(() {
-                  downloading = false;
-                  error = '$e';
-                });
-              }
+          Future<void> openReleasePage() async {
+            final opened = await AppUpdateChannel.openUrl(latest.htmlUrl);
+            if (!opened && context.mounted) {
+              setState(() => error = '无法打开浏览器，请手动前往发布页');
+            } else if (context.mounted) {
+              Navigator.of(context).pop();
             }
           }
 
@@ -74,20 +57,20 @@ Future<void> showAppUpdatePrompt(
                   if (forced) ...[
                     const SizedBox(height: 12),
                     Text(
-                      '强制更新：请尽快完成更新，否则旧版本将无法继续使用。',
+                      '发布方提示：此版本声明了更新窗口，建议尽快更新。',
                       style: TextStyle(
                         color: Theme.of(context).colorScheme.error,
                       ),
                     ),
                   ],
-                  if (downloading) ...[
-                    const SizedBox(height: 16),
-                    LinearProgressIndicator(
-                      value: total > 0 ? received / total : null,
+                  const SizedBox(height: 12),
+                  Text(
+                    '将前往发布页下载安装包，下载与安装由你在浏览器与系统安装器中完成。',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
                     ),
-                    const SizedBox(height: 6),
-                    Text(total > 0 ? '已下载 $received / $total 字节' : '正在下载…'),
-                  ],
+                  ),
                   if (error != null) ...[
                     const SizedBox(height: 12),
                     Text(
@@ -101,35 +84,19 @@ Future<void> showAppUpdatePrompt(
               ),
             ),
             actions: [
-              if (!forced)
-                TextButton(
-                  onPressed: downloading
-                      ? null
-                      : () async {
-                          await AppUpdateChecker.dismissUpdate(latest.version);
-                          if (context.mounted) {
-                            Navigator.of(context).pop();
-                          }
-                        },
-                  child: const Text('稍后再说'),
-                ),
-              if (Platform.isAndroid)
-                FilledButton(
-                  onPressed: downloading ? null : downloadAndInstall,
-                  child: Text(downloading ? '下载中…' : '下载并安装'),
-                )
-              else
-                FilledButton(
-                  onPressed: () async {
-                    final opened = await AppUpdateChannel.openUrl(
-                      latest.htmlUrl,
-                    );
-                    if (!opened && context.mounted) {
-                      setState(() => error = '无法打开浏览器，请手动前往发布页');
-                    }
-                  },
-                  child: const Text('打开发布页'),
-                ),
+              TextButton(
+                onPressed: () async {
+                  await AppUpdateChecker.dismissUpdate(latest.version);
+                  if (context.mounted) {
+                    Navigator.of(context).pop();
+                  }
+                },
+                child: const Text('稍后再说'),
+              ),
+              FilledButton(
+                onPressed: openReleasePage,
+                child: const Text('打开发布页'),
+              ),
             ],
           );
         },
