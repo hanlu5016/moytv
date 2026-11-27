@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core_bridge.dart' show AppFailure;
+import 'idj_signing.dart';
 import 'models.dart';
 
 /// iDuanJu `.idjplugin` 安装器 + 动态注册表（Dart 侧）。
@@ -375,12 +376,18 @@ class IdjPluginBundle {
     required this.script,
     required this.fileHash,
     required this.rawText,
+    this.signatureResult = const IdjSignatureResult(IdjSignatureStatus.unsigned),
   });
 
   final IdjPluginManifest manifest;
   final String script;
   final String fileHash;
   final String rawText;
+
+  /// P0-1：manifest 签名验证结果（parseBundleText 时算好）。
+  /// valid = 内置作者公钥验签通过；unsigned = 无签名块；
+  /// invalid = 有签名块但验不过（reason 带原因）。
+  final IdjSignatureResult signatureResult;
 
   /// 入口脚本按 UTF-8 算 SHA-256 再 base64（pack 脚本同款算法）。
   static String hashScript(String script) =>
@@ -664,11 +671,18 @@ class IdjPluginStore {
     }
     final fileHash = IdjPluginBundle.hashScript(script);
     _verifyIntegrity(manifest, fileHash);
+    // P0-1：真验签。签名有效 → 免确认直装；无签名/验不过 → 走
+    // 「警告 + 用户确认」路径（由 IdjSignatureGate 决定，见 installBundleText），
+    // 不静默放行也不硬拒，保住第三方插件生态。
+    final signatureResult = idjVerifyPluginSignature(
+      Map<String, dynamic>.from(manifestJson),
+    );
     return IdjPluginBundle(
       manifest: manifest,
       script: script,
       fileHash: fileHash,
       rawText: text,
+      signatureResult: signatureResult,
     );
   }
 
@@ -686,9 +700,10 @@ class IdjPluginStore {
     }
   }
 
-  // 签名口径（用户 2026-11-25 令）：只认包不认签名——`integrity.signature`
-  // 当它不存在，不验、不拒、不提示；带签名块的包照常安装。
-  // 安装校验只剩包本身：manifest 校验 + integrity 哈希 + 域名清单。
+  // P0-1 签名口径（2026-11-26 整改）：恢复验签。签名块存在且公钥 =
+  // 内置作者公钥时验签通过；无签名块 = 未签名（走确认路径）；
+  // 签名块存在但验不过 = invalid（也走确认路径，但提示里带失败原因）。
+  // 「完全绕过签名」的 v67 行为已废弃。
 
   // ---------- probe ----------
 
@@ -720,14 +735,20 @@ class IdjPluginStore {
 
   // ---------- 写盘与安装 ----------
 
-  /// 安装链：解析 → 校验 → integrity → probe → 写盘 + 索引 + 注册。
-  /// 免确认口径（用户 2026-11-25 令）：点安装直接装到底，更新时权限
-  /// 有扩大（多申请域名等）也不拦路要确认——差异只供界面在装完后
-  /// 顺带提示一句（见 [permissionDiff]），不作安装门槛。
+  /// 安装链：解析 → 校验 → integrity → 验签 → 权限差异确认（P0-2）→
+  /// probe → 写盘 + 索引 + 注册。
+  /// 确认口径（2026-11-26 整改，P0-1/P0-2）：
+  /// - 验签通过（内置作者公钥）→ 直接装到底，不弹确认；
+  /// - 无签名 / 验签失败 → 必须传 [signatureConfirmed]=true 才继续
+  ///   （UI 层弹警告 sheet；本方法只做门卫）；
+  /// - 更新时权限有扩大（多申请域名/能力/minAppVersion 升高）→ 必须传
+  ///   [permissionConfirmed]=true，否则抛错请 UI 先确认。
   /// 安装失败不留半成品：staging 删除、索引不写、站点不注册。
   Future<IdjInstalledPlugin> installBundleText(
     String text, {
     String sourceLabel = '文件',
+    bool permissionConfirmed = false,
+    bool signatureConfirmed = false,
     IdjProbeFn? probe,
   }) async {
     final bundle = parseBundleText(text, sourceLabel: sourceLabel);
@@ -737,8 +758,29 @@ class IdjPluginStore {
     String siteKey;
     if (existing != null) {
       siteKey = existing.siteKey;
+      // P0-2：权限扩大确认门槛（v66 口径恢复）。
+      final oldManifest = await readInstalledManifest(manifest.id);
+      if (oldManifest != null) {
+        final diff = permissionDiff(oldManifest, manifest);
+        if (diff.needsConfirmation && !permissionConfirmed) {
+          throw AppFailure(
+            '新版本申请了更多权限，请确认后再更新：${diff.describe().join('；')}',
+          );
+        }
+      }
     } else {
       siteKey = IdjPluginRegistry.siteKeyForPluginId(manifest.id);
+    }
+    // P0-1：签名门卫。验签通过（valid）直接放行；unsigned/invalid 需要
+    // UI 层先弹警告 sheet 并把 signatureConfirmed 置 true 才放行。
+    if (!bundle.signatureResult.isValid && !signatureConfirmed) {
+      final why = switch (bundle.signatureResult.status) {
+        IdjSignatureStatus.unsigned => '插件未签名',
+        IdjSignatureStatus.invalid =>
+          '签名验证失败（${bundle.signatureResult.reason ?? '未知原因'}）',
+        _ => '签名状态未知',
+      };
+      throw AppFailure('$why，请确认后再安装（插件 ${manifest.id}）');
     }
     final probeFn = probe ?? _probeOverride ?? probeHandler;
     if (probeFn == null) {
@@ -760,7 +802,10 @@ class IdjPluginStore {
       installedAt:
           existing?.installedAt ?? DateTime.now().millisecondsSinceEpoch,
       failures: 0,
-      publicKey: existing?.publicKey ?? '',
+      // P0-1：验签通过的插件记录公钥指纹（当前口径只有一个内置公钥）。
+      publicKey: bundle.signatureResult.isValid
+          ? kIdjBuiltInAuthorPubKey
+          : (existing?.publicKey ?? ''),
     );
     index[manifest.id] = entry;
     await _writeIndex(index);
@@ -774,6 +819,8 @@ class IdjPluginStore {
   Future<IdjInstalledPlugin> installBundleBytes(
     List<int> bytes, {
     String sourceLabel = '文件',
+    bool permissionConfirmed = false,
+    bool signatureConfirmed = false,
     IdjProbeFn? probe,
   }) async {
     String text;
@@ -785,6 +832,8 @@ class IdjPluginStore {
     return installBundleText(
       text,
       sourceLabel: sourceLabel,
+      permissionConfirmed: permissionConfirmed,
+      signatureConfirmed: signatureConfirmed,
       probe: probe,
     );
   }
@@ -1502,6 +1551,8 @@ class IdjPluginStore {
   ///（包 JSON 直接装；裸 manifest 从同目录下载脚本拼包再装）。
   Future<IdjInstalledPlugin> installFromSubscriptionPlugin(
     IdjSubscriptionPlugin plugin, {
+    bool permissionConfirmed = false,
+    bool signatureConfirmed = false,
     IdjProbeFn? probe,
   }) async {
     if (plugin.manifest != null) {
@@ -1524,6 +1575,8 @@ class IdjPluginStore {
     return installBundleText(
       interpreted.bundleText!,
       sourceLabel: '订阅',
+      permissionConfirmed: permissionConfirmed,
+      signatureConfirmed: signatureConfirmed,
       probe: probe,
     );
   }
