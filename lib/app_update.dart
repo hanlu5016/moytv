@@ -232,6 +232,11 @@ class AppUpdateChannel {
     );
   }
 
+  // P1 更新策略整改（2026-11-27）：installApk 通道已废弃，不再调用。
+  // App 不再持有「下载并安装 APK」能力；原生侧（AppUpdateBridge）可
+  // 同步移除 installApk 分支，Manifest 可移除 REQUEST_INSTALL_PACKAGES。
+  // 保留空实现以防旧调用点编译失败；请勿在新代码中调用。
+  @Deprecated('P1 整改：改走 openUrl 跳发布页，App 内不下载不安装 APK')
   static Future<void> installApk(String apkPath) =>
       _channel.invokeMethod<void>('installApk', {'path': apkPath});
 
@@ -370,6 +375,10 @@ class AppUpdateChecker {
     }
   }
 
+  // P1 更新策略整改（2026-11-27）：App 内 APK 下载已废弃（不再被调用，
+  // 保留实现以免破坏旧测试；请勿在新代码中调用）。更新统一走
+  // openUrl 跳发布页，由用户在浏览器下载、系统安装器安装。
+  @Deprecated('P1 整改：改走 openUrl 跳发布页，App 内不下载 APK')
   static Future<File> downloadApk(
     AppReleaseInfo release, {
     void Function(DownloadProgress progress)? onProgress,
