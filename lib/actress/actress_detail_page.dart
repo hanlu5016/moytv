@@ -107,10 +107,27 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
   /// 连点推两个详情页。_playWork 推页前置 true，弹回后置 false。
   var _openingDetail = false;
 
-  /// 会话级已验活地址缓存：番号（归一化）→ 竞速赢过的详情。
+  /// 会话级已验活地址缓存：番号（归一化）→ 竞速赢过的详情 + 时间。
   /// 某番号竞速赢过一次后，下次点同一番号直接用缓存的已验活
   /// 地址开页，不再等竞速。只活在 App 本次运行里，重启即清空。
-  static final Map<String, DramaDetail> _verifiedDetailCache = {};
+  /// 2026-11-28 修复：加 5 分钟时效——旧赢家地址失效后仍被优先
+  /// 首播、且不在本轮换线链里，会浪费一次首播机会并让换线无源可
+  /// 走；过期即当没缓存，重新竞速出线路。
+  static final Map<String, ({DramaDetail detail, DateTime at})>
+      _verifiedDetailCache = {};
+  static const _verifiedCacheTtl = Duration(minutes: 5);
+
+  /// 读缓存：不存在或过期都当没有，并顺手清掉过期项。
+  static DramaDetail? _cachedVerifiedDetail(String key) {
+    if (key.isEmpty) return null;
+    final entry = _verifiedDetailCache[key];
+    if (entry == null) return null;
+    if (DateTime.now().difference(entry.at) > _verifiedCacheTtl) {
+      _verifiedDetailCache.remove(key);
+      return null;
+    }
+    return entry.detail;
+  }
 
   /// 已加载的数据库作品数（翻页 offset 用它，不用 _works.length——
   /// _works 里还混着 json 补的作品，用它当 offset 会跳过数据库作品）。
@@ -855,7 +872,10 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
     unawaited(
       raceFuture.then((winner) {
         if (winner != null && cacheKey.isNotEmpty) {
-          _verifiedDetailCache[cacheKey] = winner;
+          _verifiedDetailCache[cacheKey] = (
+            detail: winner,
+            at: DateTime.now(),
+          );
         }
       }, onError: (_) {}),
     );
@@ -870,7 +890,7 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
     // 条（2026-11-26 20:10 口径保留在竞速内部：115 短优先
     // 窗、在线与本地库同尺、第一条验活起播——那是换线与
     // 库外番号的起播序，不再做库内首播的前置门）。
-    final cached = cacheKey.isEmpty ? null : _verifiedDetailCache[cacheKey];
+    final cached = _cachedVerifiedDetail(cacheKey);
     var firstDetail =
         cached ?? (dbRows.isNotEmpty ? dbRows.first.toDramaDetail() : null);
     if (firstDetail == null) {
@@ -934,7 +954,29 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
         triedUrls.add(url);
         return (detail: row.toDramaDetail(), episodeIndex: 0);
       }
-      // 链耗尽：返回 null，播放器保留原错误界面。
+      // 3. 2026-11-28 修复：链耗尽不直接认输——当场重探一次在线
+      // 线路。首播竞速若因网络慢/出口限制全灭，verifiedLines 会是
+      // 空的；此时按番号重新并行探一次在线源，探到就换过去，避免
+      // 「女优库播放无法自动换源」（其他标签有多线路所以正常）。
+      final reprobe = await _reprobeOnlineLines(
+        code: currentWork.codeKey,
+        title: currentWork.displayTitle,
+        triedUrls: triedUrls,
+      );
+      if (reprobe != null) {
+        final url = _detailPlayUrl(reprobe);
+        if (url.isNotEmpty) triedUrls.add(url);
+        // 重探成功也更新会话缓存，下次同番号直达。
+        if (cacheKey.isNotEmpty) {
+          _verifiedDetailCache[cacheKey] = (
+            detail: reprobe,
+            at: DateTime.now(),
+          );
+        }
+        return (detail: reprobe, episodeIndex: 0);
+      }
+      // 链耗尽：清掉该番号缓存（地址已证实失效），下次进页重新竞速。
+      if (cacheKey.isNotEmpty) _verifiedDetailCache.remove(cacheKey);
       return null;
     }
 
@@ -963,6 +1005,14 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
         if (url.isNotEmpty) triedUrls.add(url);
         return (detail: first, episodeIndex: 0);
       }
+      // 2026-11-28：重试也走一次在线重探，并清掉失效缓存。
+      if (cacheKey.isNotEmpty) _verifiedDetailCache.remove(cacheKey);
+      final reprobe = await _reprobeOnlineLines(
+        code: currentWork.codeKey,
+        title: currentWork.displayTitle,
+        triedUrls: triedUrls,
+      );
+      if (reprobe != null) return (detail: reprobe, episodeIndex: 0);
       return null;
     }
 
@@ -1367,6 +1417,61 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
       );
     } catch (_) {
       return null;
+    }
+  }
+
+  /// 2026-11-28 换线兜底重探：首播竞速全灭（verifiedLines 空）且库里
+  /// 没有第二条地址时，按番号并行重探在线源，谁先出验活线路用谁。
+  /// 复用首播那几路的验活尺子，但不带 cancel/generation 门槛——这是
+  /// 换线阶段的新一轮独立探查。全部失败返回 null（播放器留错误界面）。
+  Future<DramaDetail?> _reprobeOnlineLines({
+    required String code,
+    required String title,
+    required Set<String> triedUrls,
+  }) async {
+    if (code.trim().isEmpty) return null;
+    final cancel = Completer<void>();
+    final probes = <Future<DramaDetail?>>[
+      _raceMissav(
+        code: code,
+        title: title,
+        cancel: cancel,
+        playGeneration: _playGeneration,
+      ),
+      for (final source in kActressLineSources)
+        _raceOnlineSource(
+          source: source,
+          code: code,
+          cancel: cancel,
+          playGeneration: _playGeneration,
+        ),
+      for (final sourceId in kActressPyRaceSourceIds)
+        _racePySource(
+          sourceId: sourceId,
+          code: code,
+          cancel: cancel,
+          playGeneration: _playGeneration,
+        ),
+    ];
+    // 谁先出可播线路用谁（First-completed），最多等 25 秒。
+    // 每条探针自身已带验活尺子与超时，这里只做并发竞速与封顶。
+    // 探针失败或命中已试地址时给一个永不完成的 future，让它不参与
+    // 竞速（Future.any 只认第一个真正 resolve 出线路的）。
+    final never = Completer<DramaDetail?>().future;
+    try {
+      final winner = await Future.any(
+        probes.map(
+          (p) => p.catchError((_) => null as DramaDetail?).then((d) {
+            if (d == null) return never;
+            final url = _detailPlayUrl(d);
+            if (url.isEmpty || triedUrls.contains(url)) return never;
+            return Future<DramaDetail?>.value(d);
+          }),
+        ),
+      ).timeout(const Duration(seconds: 25), onTimeout: () => null);
+      return winner;
+    } finally {
+      if (!cancel.isCompleted) cancel.complete();
     }
   }
 
