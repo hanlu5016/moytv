@@ -1714,13 +1714,18 @@ class _PlayerScreenState extends State<PlayerScreen>
   /// 返回 true 表示已换核重试，调用方不要再显示错误。
   bool _tryCoreFallback(String message) {
     if (_closed || _plan?.local == true) return false;
+    // 2026-11-28 修复：站源/网络类失败不换核——换播放器核解决不了
+    // 站源不可访问（404/超时/连接失败），只会空转 mpv→exo→ijk 一轮，
+    // 把换源时机推迟几十秒。网络类直接返回 false，让调用方走
+    // _notifyPlaybackExhausted 换源（女优库换线链/其他源重试）。
+    // 解码/格式类仍按档位换核（那些是核自身能力问题，换核有效）。
+    final kind = classifyPlayerCoreFailure(message);
+    if (kind == CoreFailureKind.network) return false;
     _coreFallback ??= CoreFallbackController(
       start: _effectiveCore,
       mode: _fallbackMode,
     );
-    final next = _coreFallback!.advance(
-      classifyPlayerCoreFailure(message),
-    );
+    final next = _coreFallback!.advance(kind);
     if (next == null) return false;
     final position = _currentPosition;
     _fallbackCoreOverride = next;
