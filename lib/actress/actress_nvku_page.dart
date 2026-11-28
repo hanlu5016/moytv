@@ -4,7 +4,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../app_page_route.dart';
 import '../core_bridge.dart';
+import '../detail_screen.dart' show DetailNextLine, DetailScreen;
 import '../local_store.dart';
 import '../models.dart';
 import '../player_picker.dart';
@@ -615,22 +617,61 @@ class _ActressNvkuPageState extends State<ActressNvkuPage> {
 
   bool _isFavorite(String id) => _favorites.any((row) => row.id == id);
 
+  /// 首页作品播放（2026-11-28 优化）：改用 DetailScreen + 换线回调，
+  /// 与女优详情页同一套"耗尽换源"能力——当前源挂了自动按 peers
+  /// （跨源副本）逐个换源重播，而不是像旧版 pushPlayer 裸播、一个
+  /// 地址失败就弹"暂时取不到播放地址"。
   Future<void> _play(Drama drama) async {
     try {
       final detail = await widget.repository.detail(drama);
       if (!mounted) return;
-      if (detail.episodes.isEmpty) {
+      if (detail.episodes.isEmpty && drama.peers.isEmpty) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text('这条暂时没有可播地址')));
         return;
       }
-      await pushPlayer<void>(
-        context,
-        detail: detail,
-        initialIndex: 0,
-        repository: widget.repository,
-        store: widget.store,
+      // 换线链：当前源（detail）已在播，耗尽时依次按 peers（跨源
+      // 副本）detail(peer) 取新线路；peers 空则换不出，返回 null
+      // （保留播放器错误界面，与女优详情页同口径）。
+      final candidates = drama.peers;
+      var cursor = 0;
+      Future<DetailNextLine?> nextLine() async {
+        while (cursor < candidates.length) {
+          final peer = candidates[cursor++];
+          if (peer.id == drama.id) continue;
+          try {
+            final peerDetail = await widget.repository.detail(peer);
+            if (peerDetail.episodes.isNotEmpty) {
+              return (detail: peerDetail, episodeIndex: 0);
+            }
+          } catch (_) {
+            // 这个源取不到，换下一个 peer。
+          }
+        }
+        return null;
+      }
+
+      Future<DetailNextLine?> retryProbe() async {
+        // 重试：重新从候选链探一遍（首播源由播放器原地重播兜底）。
+        cursor = 0;
+        return nextLine();
+      }
+
+      await Navigator.of(context).push<void>(
+        appPageRoute<void>(
+          settings: const RouteSettings(name: 'detail'),
+          builder: (_) => DetailScreen(
+            drama: drama,
+            repository: widget.repository,
+            store: widget.store,
+            autoPlayOnOpen: true,
+            autoPlayEpisodeIndex: 0,
+            initialDetail: detail.episodes.isNotEmpty ? detail : null,
+            nextLineOnExhausted: nextLine,
+            onRetryProbe: retryProbe,
+          ),
+        ),
       );
     } catch (_) {
       if (!mounted) return;
