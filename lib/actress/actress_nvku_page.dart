@@ -891,9 +891,21 @@ class _ActressNvkuPageState extends State<ActressNvkuPage> {
 
   /// 源切换：女优库（本地库直读 + py 版 who's 链）与两个在线
   /// 源之间切；切源不清搜索框，在线源的词单独记在 [_onlineQuery]。
+  /// 2026-11-28 修复：切源必须清掉首页作品第一页缓存——
+  /// [NvkuEntryCache] 的 works 缓存键只有 category|query、不含源，
+  /// 且 TTL 5 分钟内 isFresh 直接返回不取数。不清缓存时，从在线源
+  /// 切回女优库（或反之）首页读到的还是旧源留下的缓存，表现为
+  /// 「首页不换源」；女优/收藏 tab 不走这份缓存所以正常。
   void _selectSource(String id) {
     if (_onlineId == id) return;
+    // 清掉首页作品第一页缓存（其键 category|query 不含源，切源后会串）。
+    NvkuEntryCache.clear();
     setState(() => _onlineId = id);
+    // 切回女优库（本地库 + py who's 链）时，首页是 IndexedStack 常驻，
+    // 光改 _onlineId 不会重新取数；显式重载首页让它用新源的数据刷新。
+    // 在线源各自有独立视图（JavdbSourceView / ActressOnlineSourceView），
+    // 它们自己加载，不需要这里重载。
+    if (id.isEmpty) unawaited(_loadWorks(reset: true));
   }
 
   /// 顶栏（2026-11-26 照 AvPlay 截图改浅色：白底 + 浅灰底边，
